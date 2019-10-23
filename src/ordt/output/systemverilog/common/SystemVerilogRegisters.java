@@ -39,16 +39,22 @@ public class SystemVerilogRegisters {
 		this.writer = writer;
 	}
 
-	/** retrieve a register or add if a new name **/
-	public VerilogRegInfo get(String name) {
+	/** retrieve register info by name or add create and return if a new name 
+	 * @param name - name of this reg group
+	 * @param clkName - clock to be used for this group
+	 * @param useNegClkEdge - clock edge to be used for this group
+	 * @param checkClockConsistency - if true, incoming clock name and edge type will be checked for consistency with previous values for this reg group
+	 **/
+	public VerilogRegInfo getOrCreate(String name, String clkName, boolean useNegClkEdge, boolean checkClockConsistency) {
 		VerilogRegInfo regInfo = this.registers.get(name);
 		if (regInfo == null) {
-			regInfo = new VerilogRegInfo(name);
+			regInfo = new VerilogRegInfo(name, clkName, useNegClkEdge); // define a new reg group using the active clock 
 			this.registers.put(name, regInfo);  // save new reginfo in hashmap
 		}
+		else if (checkClockConsistency) regInfo.checkClock(clkName, useNegClkEdge);  // FIXME - this is called by combinassign with default clk
 		return regInfo;
 	}
-	
+
 	/** add a reset signal to reg group
 	 *  @param reset - name of reset signal
 	 *  @param activeLow - true if reset is active low
@@ -79,6 +85,7 @@ public class SystemVerilogRegisters {
 	public  class VerilogRegInfo {
 		private String name;   // name of this register/always group
 		private String clock;  // clock name for synchronous assigns
+		private boolean useNegClkEdge;
 		private HashMap<String, List<String>> resetAssignList;  // reset assignments for each reset signal		
 		private  List<String> regAssignList;    // list of synchronous reg assigns
 		private  List<String> combinAssignList;    // list of combinatorial assign statements
@@ -90,15 +97,22 @@ public class SystemVerilogRegisters {
 		/**
 		 * @param name - name of this reg group
 		 */
-		public VerilogRegInfo(String name) {
-			this.setName(name);
-			this.setClock(clkName);    // use default clock name for this register group
+		public VerilogRegInfo(String name, String clock, boolean useNegClkEdge) {
+			this.setName(name);      // unique description for this group
+			this.setClock(clock);    // use this clock name for this register group
+			this.useNegClkEdge = useNegClkEdge;
 			this.resetAssignList= new HashMap<String, List<String>>();  // reset assignments for each reset signal		
 			this.regAssignList = new ArrayList<String>();    // list of synchronous reg assigns
 			this.combinAssignList = new ArrayList<String>();    // list of combinatorial assign statements
 			this.hiPrecCombinAssignList = new ArrayList<String>();    // list of high precedence combinatorial assign statements
 			this.lowPrecCombinAssignList = new ArrayList<String>();    // list of low precedence combinatorial assign statements
 			this.signalsWithResetAssigns= new HashSet<String>();  // set of signals having a reset assign		
+		}
+		
+		/** verify that this reginfo instance has specified clock name and capture edge */
+		public void checkClock(String clkName, boolean useNegClkEdge) {
+			if (!this.clock.equals(clkName) || (this.useNegClkEdge != useNegClkEdge))
+				MsgUtils.errorExit("mismatched clock info found for register group=" + name);
 		}
 		
 		/** get name of this group */
@@ -242,24 +256,39 @@ public class SystemVerilogRegisters {
 				// write any saved precedence statements
 				writeLowPrecedenceStatements(indentLevel);
 				writeHiPrecedenceStatements(indentLevel);
-				writer.writeStmt(--indentLevel, "end");  
-				writer.writeStmt(indentLevel, "");  			
+				writeBlockFooter(--indentLevel);
 			}
 			
 			// write synchronous assignment block
 			if (!regAssignList.isEmpty()) {
 				//System.out.println("VerilogRegInfo writeVerilog: assigned reset sigs=" + signalsWithResetAssigns);
-				writer.writeStmt(indentLevel, "//------- reg assigns for " + name);
-				String asyncStr = useAsyncResets? genAsyncString() : "";
-				if (SystemVerilogModule.isLegacyVerilog()) writer.writeStmt(indentLevel++, "always @ (posedge " + clkName + asyncStr + ") begin");  
-				else writer.writeStmt(indentLevel++, "always_ff @ (posedge " + clkName + asyncStr + ") begin");  
-				writeRegResets(indentLevel, resetAssignList);
-				writeRegAssigns(indentLevel, regAssignList);
-				writer.writeStmt(--indentLevel, "end");  
-				writer.writeStmt(indentLevel, "");  		
+				writeSyncBlockHeader(indentLevel++, true);
+				writeRegResets(indentLevel);
+				writeRegAssigns(indentLevel);
+				writeBlockFooter(--indentLevel);
 			}
 		}
+
+		/** create synchronous always block header **
+		 * 
+		 * @param indentLevel
+		 * @param allowAsyncResetSensitivities - if false, no async resets are added to sensitivity list even if group has async resets 
+		 */
+		private void writeSyncBlockHeader(int indentLevel, boolean allowAsyncResetSensitivities) {
+			String noResetStr = allowAsyncResetSensitivities? "" : " (no reset)";
+			writer.writeStmt(indentLevel, "//------- reg assigns for " + name + noResetStr);
+			String asyncStr = (allowAsyncResetSensitivities && useAsyncResets && hasResetAssigns())? genAsyncString() : "";
+			String clkEdgeType = this.useNegClkEdge? "negedge " : "posedge ";
+			if (SystemVerilogModule.isLegacyVerilog()) writer.writeStmt(indentLevel, "always @ (" + clkEdgeType + clkName + asyncStr + ") begin");  
+			else writer.writeStmt(indentLevel, "always_ff @ (" + clkEdgeType + clkName + asyncStr + ") begin");  
+		}
 		
+		/** complete always block */
+		private void writeBlockFooter(int indentLevel) {
+			writer.writeStmt(indentLevel, "end");  
+			writer.writeStmt(indentLevel, "");  		
+		}
+
 		/** generate always activation list for async resets */
 		private String genAsyncString() {
 			String outStr = "";
@@ -270,15 +299,15 @@ public class SystemVerilogRegisters {
 			return outStr;
 		}
 		/** write always block reset stmts */
-		private  void writeRegResets(int indentLevel, HashMap<String, List<String>> regResetList) {
+		private  void writeRegResets(int indentLevel) {
 			// write reset assigns for each reset signal
 			String firstRst = "";
-			for (String reset: regResetList.keySet()) {
-				if (!regResetList.get(reset).isEmpty()) {
+			for (String reset: resetAssignList.keySet()) {
+				if (!resetAssignList.get(reset).isEmpty()) {
 				   String notStr = (resetActiveLow.get(reset)) ? "! " : "";
 				   writer.writeStmt(indentLevel++, firstRst + "if (" + notStr + reset + ") begin");  
 				   firstRst = "else ";
-				   Iterator<String> it = regResetList.get(reset).iterator();
+				   Iterator<String> it = resetAssignList.get(reset).iterator();
 				   while (it.hasNext()) {
 					   String stmt = it.next();
 					   writer.writeStmt(indentLevel, stmt);  
@@ -289,7 +318,7 @@ public class SystemVerilogRegisters {
 		}
 		
 		/** write always block assign stmts */
-		private  void writeRegAssigns(int indentLevel, List<String> regAssignList) {
+		private void writeRegAssigns(int indentLevel) {
 			if (regAssignList.isEmpty()) return;
 			boolean hasResets = hasResetAssigns();
 			List<String> movedAssignList = new ArrayList<String>();
@@ -307,6 +336,11 @@ public class SystemVerilogRegisters {
 			}		   			
 			if (hasResets) writer.writeStmt(--indentLevel, "end");  
 			// move non-reset assigns out of else block
+			if (movedAssignList.isEmpty()) return;
+			if (useAsyncResets) {  // if using async resets move these to a separate always block
+				writeBlockFooter(--indentLevel);
+				writeSyncBlockHeader(indentLevel++, false);
+			}
 			it = movedAssignList.iterator();
 			while (it.hasNext()) {
 				String stmt = it.next();

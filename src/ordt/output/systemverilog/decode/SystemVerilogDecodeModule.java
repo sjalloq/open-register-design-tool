@@ -1,9 +1,10 @@
 /*
  * Copyright (c) 2016 Juniper Networks, Inc. All rights reserved.
  */
-package ordt.output.systemverilog;
+package ordt.output.systemverilog.decode;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 
@@ -11,9 +12,14 @@ import ordt.output.common.MsgUtils;
 import ordt.extract.RegNumber;
 import ordt.extract.RegNumber.NumBase;
 import ordt.extract.RegNumber.NumFormat;
+import ordt.output.systemverilog.SystemVerilogBuilder;
+import ordt.output.systemverilog.SystemVerilogDefinedOrdtSignals;
 import ordt.output.systemverilog.SystemVerilogDefinedOrdtSignals.DefSignalType;
+import ordt.output.systemverilog.common.RemapRuleList;
 import ordt.output.systemverilog.common.SystemVerilogModule;
 import ordt.output.systemverilog.common.SystemVerilogSignal;
+import ordt.output.systemverilog.common.RemapRuleList.RemapRuleType;
+import ordt.output.systemverilog.common.SystemVerilogInstance;
 import ordt.output.systemverilog.common.io.SystemVerilogIOSignalList;
 import ordt.output.AddressableInstanceProperties;
 import ordt.output.FieldProperties;
@@ -96,7 +102,7 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
 	}
 
 	/** returns true if this decoder has a secondary processor interface */
-	boolean hasSecondaryInterface() {
+	public boolean hasSecondaryInterface() {
 		return ((builder.isBaseBuilder() || ExtParameters.secondaryOnChildAddrmaps()) && !hasSecondaryInterfaceType(SVDecodeInterfaceTypes.NONE));
 	}
 
@@ -132,6 +138,7 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
         //System.out.println("SystemVerilogDecode genPrimaryPioInterface: isS8=" + hasPrimaryInterfaceType(SVDecodeInterfaceTypes.SERIAL8));
 		// create interface logic
 		if (hasPrimaryInterfaceType(SVDecodeInterfaceTypes.LEAF)) this.genLeafPioInterface(topRegProperties, true);
+		else if (hasPrimaryInterfaceType(SVDecodeInterfaceTypes.SPI)) this.genSpiPioInterface(topRegProperties, true);
 		else if (hasPrimaryInterfaceType(SVDecodeInterfaceTypes.SERIAL8)) this.genSerial8PioInterface(topRegProperties, true);
 		else if (hasPrimaryInterfaceType(SVDecodeInterfaceTypes.RING8)) this.genRingPioInterface(8, topRegProperties, true);
 		else if (hasPrimaryInterfaceType(SVDecodeInterfaceTypes.RING16)) this.genRingPioInterface(16, topRegProperties, true);
@@ -148,8 +155,8 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
 	private void genSecondaryPioInterface(AddressableInstanceProperties topRegProperties) {
 		// create interface logic
 		if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.NONE)) return;
-		//if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.LEAF)) this.genLeafPioInterface(topRegProperties, false);
-		if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.SERIAL8)) this.genSerial8PioInterface(topRegProperties, false);
+		if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.SPI)) this.genSpiPioInterface(topRegProperties, false);
+		else if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.SERIAL8)) this.genSerial8PioInterface(topRegProperties, false);
 		else if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.RING8)) this.genRingPioInterface(8, topRegProperties, false);
 		else if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.RING16)) this.genRingPioInterface(16, topRegProperties, false);
 		else if (hasSecondaryInterfaceType(SVDecodeInterfaceTypes.RING32)) this.genRingPioInterface(32, topRegProperties, false);
@@ -1539,10 +1546,38 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
 			this.addWireAssign(ioRdWidth + " = " + externalDataBitSize + "'b0;"); 
 		}
 	}
+	
+	/** add spi pio interface */
+	private void genSpiPioInterface(AddressableInstanceProperties topRegProperties, boolean isPrimary) {  // TODO add spi mode/controls
+		// create spi module and instance it
+		SystemVerilogSpiPioIfModule pioIfModule = new SystemVerilogSpiPioIfModule(builder, this);
+		// build remap rules for pio if
+		RemapRuleList rules = new RemapRuleList();
+		String pioPrefix = (topRegProperties == null)? "" : topRegProperties.getBaseName() + "_";
+		if (this.hasSecondaryInterface()) pioPrefix = (isPrimary? "p1_" : "p2_") + pioPrefix;
+		if (!pioPrefix.isEmpty()) {
+			rules.addRule(SystemVerilogBuilder.PIO, SystemVerilogBuilder.DECODE_PIO_IF, RemapRuleType.ADD_PREFIX, pioPrefix);
+			rules.addRule(SystemVerilogBuilder.DECODE_PIO_IF, SystemVerilogBuilder.PIO, RemapRuleType.ADD_PREFIX, pioPrefix);
+		}
+		// build remap rules for the internal interface
+		String intPrefix = this.hasSecondaryInterface()? (isPrimary? "p1_" : "p2_") : "";
+		if (!intPrefix.isEmpty()) {
+			rules.addRule(SystemVerilogBuilder.DECODE, SystemVerilogBuilder.DECODE_PIO_IF, RemapRuleType.ADD_PREFIX, intPrefix);
+			rules.addRule(SystemVerilogBuilder.DECODE_PIO_IF, SystemVerilogBuilder.DECODE, RemapRuleType.ADD_PREFIX, intPrefix);
+		}
+		// instance the pio interface module
+		SystemVerilogInstance pioInst = this.addInstance(pioIfModule, (isPrimary? "p1_pio_if" : "p2_pio_if"), rules);
+		
+		// add IOs and internal wire defines
+		HashSet<String> uniqueSigs = new HashSet<String>();
+		uniqueSigs.add(SystemVerilogBuilder.getDecodeClk());
+		uniqueSigs.add(builder.getDefaultReset());
+		inheritChildSignals(pioInst, uniqueSigs, getIOList(SystemVerilogBuilder.PIO), false);
+	}
 
 	/** add serial8 pio interface */
 	private void genSerial8PioInterface(AddressableInstanceProperties topRegProperties, boolean isPrimary) {  
-		//System.out.println("SystemVerilogDecodeModule: generating decoder with external interface, id=" + topRegProperties.getInstancePath());
+		//System.out.println("SystemVerilogDecodeModule: generating decoder with serial8 interface, id=" + topRegProperties.getInstancePath());
 		// set internal interface names
 		String pioInterfaceAddressName = getSigName(isPrimary, this.pioInterfaceAddressName);
 		String pioInterfaceWriteDataName = getSigName(isPrimary, this.pioInterfaceWriteDataName);
@@ -1877,7 +1912,7 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
 
 	/** add ring pio interface */ 
 	private void genRingPioInterface(int ringWidth, AddressableInstanceProperties topRegProperties, boolean isPrimary) {
-		//System.out.println("SystemVerilogDecodeModule: generating decoder with external interface, id=" + topRegProperties.getInstancePath());
+		//System.out.println("SystemVerilogDecodeModule: generating decoder with ring interface, id=" + topRegProperties.getInstancePath());
 		// set internal interface names
 		String pioInterfaceAddressName = getSigName(isPrimary, this.pioInterfaceAddressName);
 		String pioInterfaceWriteDataName = getSigName(isPrimary, this.pioInterfaceWriteDataName);
@@ -4222,7 +4257,7 @@ public class SystemVerilogDecodeModule extends SystemVerilogModule {
 	}
 
 	/** return true if this map contains multiple addressed elements */
-	private boolean mapHasMultipleAddresses() {
+	boolean mapHasMultipleAddresses() {
 		return builder.getMapAddressWidth() >= 1;
 	}
 
